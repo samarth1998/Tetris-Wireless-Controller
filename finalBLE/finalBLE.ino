@@ -1,0 +1,263 @@
+#include <CurieIMU.h>
+
+
+/** BLE Definitions and Global Variables **/
+#define BOARD_NAME "1300C5"
+#include <CurieBLE.h>
+
+int readVal1, readVal2, readVal3, GX, GY, GZ, AX, AY, AZ, sensorValMax, EMGData;
+float sensorValTrial[1000];
+#define GThre 27000
+#define AThre 20000
+#define BUTTON_DEBUG_DISPLAY_VALUE 40000
+
+typedef struct {  // This structure is important -- it's an agreement between the sender and receiver
+  int index;
+  char command;
+} gameCommand;
+
+BLEPeripheral blePeripheral;  // The blePeripheral
+BLEService bleGameService("F7580001-153E-D4F6-F26D-43D8D98EEB13"); // Command Data Characteristic
+BLECharacteristic bleGameChar("F7580003-153E-D4F6-F26D-43D8D98EEB13", // standard 128-bit characteristic UUID
+                              BLERead | BLENotify, sizeof(gameCommand));   // remote clients will be able to
+// get notifications if this characteristic changes
+
+void initBle() {
+  pinMode(13, OUTPUT);   // initialize the LED on pin 13 to indicate when a central is connected
+  /* Set a local name for the BLE device
+    This name will appear in advertising packets
+    and can be used by remote devices to identify this BLE device
+    The name can be changed but maybe be truncated based on space left in advertisement packet */
+  blePeripheral.setLocalName(BOARD_NAME);
+  blePeripheral.setAdvertisedServiceUuid(bleGameService.uuid());  // add the service UUID
+
+  blePeripheral.addAttribute(bleGameService);   // Add the Game service
+  blePeripheral.addAttribute(bleGameChar); // add the Game characteristic
+
+  // assign event handler for disconnected to peripheral event
+  blePeripheral.setEventHandler(BLEDisconnected, peripheralDisconnectHandlerBle);
+
+  /* Now activate the BLE device.  It will start continuously transmitting BLE
+    advertising packets and will be visible to remote BLE central devices
+    until it receives a new connection */
+  blePeripheral.begin();
+}
+
+void connectBle() {
+  // Since we are a peripheral we need a central object to connect to
+  BLECentral central = blePeripheral.central();
+
+  while (!central) {
+    delay(100);
+    central = blePeripheral.central();
+  }
+
+  // if a central is connected to peripheral:
+  if (central)
+  {
+    Serial.print("Connected to central: ");
+    // print the central's MAC address:
+    Serial.println(central.address());
+
+
+    // turn on the LED to indicate the connection:
+    digitalWrite(13, HIGH);
+  }
+}
+
+void peripheralDisconnectHandlerBle(BLECentral& central) {
+  // central disconnected event handler
+  Serial.print("Disconnected event, central: ");
+  Serial.println(central.address());
+
+  // turn off the LED to indicate the disconnection:
+  digitalWrite(13, LOW);
+}
+
+void writeGameCommand(char command) {
+  static int index = 0;
+  gameCommand gc;
+
+  gc.index = index++;
+  gc.command = command;
+
+  bleGameChar.setValue((unsigned char *) &gc, sizeof(gc));
+  Serial.println(command); // for debugging
+}
+
+//** END BLE Definitions and Global Variables *//
+
+
+// Below is an example of a very simple control scheme
+
+void setup() {
+  initBle();  // Initialized BLE system use the provided board name to pair with your receiver
+  connectBle();          // Connect to the "Central" Board (receiver board in this setup)
+  CurieIMU.begin();
+  CurieIMU.setGyroRange(1000);
+  CurieIMU.setAccelerometerRange(3);
+  Serial.begin(9600);
+}
+
+void loop() {
+  updateData();
+  while (GX <= GThre && GX >= -GThre && AX >= -AThre && AZ <= AThre && (EMGData <= 350)) {
+    updateData();
+    delay(1);
+    Serial.println(EMGData);
+  }
+  if (AX < -AThre)
+    writeGameCommand('U');
+  else if (AZ > AThre)
+    writeGameCommand('B');
+  else if (GX > GThre)
+    writeGameCommand('L');
+  else if (GX < -GThre)
+    writeGameCommand('R');
+  else if (EMGData > 350) {
+    writeGameCommand('A');
+    writeGameCommand('A');
+    while (EMGData > 20)
+      updateData();
+    delay(50);
+  }
+  delay(100);
+  updateData();
+  if (abs(GX) > GThre || abs(AX) > AThre || EMGData > 40)
+    delay(200);
+
+}
+
+int retrieveData(int sensor, int axis) {
+  if (sensor == 1)
+    CurieIMU.readGyro(readVal1, readVal2, readVal3);
+  else if (sensor == 2)
+    CurieIMU.readAccelerometer(readVal1, readVal2, readVal3);
+  if (axis == 1)
+    return readVal1;
+  else if (axis == 2)
+    return readVal2;
+  else
+    return readVal3;
+}
+
+void updateData() {
+  GX = retrieveData(1, 1);
+  GY = retrieveData(1, 2);
+  GZ = retrieveData(1, 3);
+  AX = retrieveData(2, 1);
+  AY = retrieveData(2, 2);
+  AZ = retrieveData(2, 3);
+  EMGData = getEMGValue();
+}
+
+double getEMGValue() {
+  static double sensorValue;
+  sensorValue = analogRead(A0); //* 0.0049 ;
+  sensorValue = sensorValue * 3.3 / 1024 + 1.5;
+  sensorValue *= 1000;
+  sensorValue = highthirdOrderIIR_TEMPLATE(sensorValue);
+  sensorValue = lowthirdOrderIIR_TEMPLATE(sensorValue);
+  sensorValue = abs(sensorValue);
+  sensorValue = boxcarFilterSample(sensorValue);
+  return sensorValue;
+}
+
+//Filter Functions---------------------------------------------------------------------------------------------------------
+
+float boxcarFilterSample(float sample)
+{
+  static const int boxcarWidth = 100; // Change this value to alter boxcar length
+  static float recentSamples[boxcarWidth] = {0}; // hold onto recent samples
+  static int readIndex = 0;              // the index of the current reading
+  static float total = 0;                  // the running total
+  static float average = 0;                // the average
+
+  // subtract the last reading:
+  total = total - recentSamples[readIndex];
+  // add new sample to list (overwrite oldest sample)
+  recentSamples[readIndex] = sample;
+  // add the reading to the total:
+  total = total + recentSamples[readIndex];
+  // advance to the next position in the array:
+  readIndex = readIndex + 1;
+
+  // if we're at the end of the array...
+  if (readIndex >= boxcarWidth) {
+    // ...wrap around to the beginning:
+    readIndex = 0;
+  }
+
+  // calculate the average:
+  average = total / boxcarWidth;
+  // send it to the computer as ASCII digits
+  return average;
+}
+
+float highthirdOrderIIR_TEMPLATE(float sample)
+{
+  static const float a[4] = {1., -2.37409474,  1.92935567, -0.53207537}; // ADD A VALUES HERE
+  static const float b[4] = {0.72944072, -2.18832217,  2.18832217, -0.72944072};// ADD B VALUES HERE
+
+  // x array for holding recent inputs (newest input as index 0, delay
+  //of 1 at index 1, etc.
+  static float x[4] = {0};
+  // x array for holding recent inputs (newest input as index 0, delay
+  //of 1 at index 1, etc.
+  static float y[4] = {0};
+
+  x[0] = sample;
+
+  // Calculate the output filtered signal based on a weighted sum of
+  //previous inputs/outputs
+  y[0] = (b[0] * x[0] + b[1] * x[1] + b[2] * x[2] + b[3] * x[3]) - (a[1] * y[1] + a[2] * y[2] + a[3] * y[3]);
+  y[0] /= a[0];
+
+  // Shift the input signals by one timestep to prepare for the next
+  //call to this function
+  x[3] = x[2];
+  x[2] = x[1];
+  x[1] = x[0];
+
+  // Shift the previously calculated output signals by one time step
+  //to prepare for the next call to this function
+  y[3] = y[2];
+  y[2] = y[1];
+  y[1] = y[0];
+
+  return y[0];
+}
+
+float lowthirdOrderIIR_TEMPLATE(float sample)
+{
+  static const float a[4] = {1.00000000e+00, -2.77555756e-16, 3.33333333e-01, -1.85037171e-17}; // ADD A VALUES HERE
+  static const float b[4] = {0.16666667,  0.5       ,  0.5      ,  0.16666667}; // ADD B VALUES HERE
+
+  // x array for holding recent inputs (newest input as index 0, delay
+  //of 1 at index 1, etc.
+  static float x[4] = {0};
+  // x array for holding recent inputs (newest input as index 0, delay
+  //of 1 at index 1, etc.
+  static float y[4] = {0};
+
+  x[0] = sample;
+
+  // Calculate the output filtered signal based on a weighted sum of
+  //previous inputs/outputs
+  y[0] = (b[0] * x[0] + b[1] * x[1] + b[2] * x[2] + b[3] * x[3]) - (a[1] * y[1] + a[2] * y[2] + a[3] * y[3]);
+  y[0] /= a[0];
+
+  // Shift the input signals by one timestep to prepare for the next
+  //call to this function
+  x[3] = x[2];
+  x[2] = x[1];
+  x[1] = x[0];
+
+  // Shift the previously calculated output signals by one time step
+  //to prepare for the next call to this function
+  y[3] = y[2];
+  y[2] = y[1];
+  y[1] = y[0];
+
+  return y[0];
+}
